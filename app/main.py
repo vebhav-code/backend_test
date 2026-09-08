@@ -44,7 +44,7 @@ def health():
 
 @app.head("/headhealth")
 def health_head():
-    return
+    return {"status" : "ok"}
 
 
 if __name__ == "__main__":
