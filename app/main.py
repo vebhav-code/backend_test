@@ -42,7 +42,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.head("/health")
+@app.head("/headhealth")
 def health_head():
     return
 
