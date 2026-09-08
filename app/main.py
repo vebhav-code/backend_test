@@ -42,9 +42,9 @@ def health():
     return {"status": "ok"}
 
 
-@app.head("/headhealth")
+@app.head("/health")
 def health_head():
-    return {"status" : "ok"}
+    return
 
 
 if __name__ == "__main__":
