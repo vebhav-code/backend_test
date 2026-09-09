@@ -31,6 +31,11 @@ def create_order(payload: RazorpayCreateOrderRequest):
     Create a Razorpay order in the smallest currency unit (e.g. paise for INR).
     Returns order details and public key_id for client checkout integration.
     """
+    logger.info(
+        "Incoming Razorpay create-order endpoint reached: amount=%d paise, currency=%s",
+        payload.amount,
+        payload.currency,
+    )
     order_data = create_razorpay_order(
         amount=payload.amount,
         currency=payload.currency,
@@ -62,6 +67,11 @@ def verify_payment(payload: RazorpayVerifyPaymentRequest):
     Verify the payment signature returned by the Razorpay checkout.
     Uses HMAC-SHA256 signature verification via the official Razorpay SDK.
     """
+    logger.info(
+        "Incoming Razorpay verify-payment endpoint reached: order_id=%s, payment_id=%s",
+        payload.razorpay_order_id,
+        payload.razorpay_payment_id,
+    )
     verify_razorpay_payment(
         order_id=payload.razorpay_order_id,
         payment_id=payload.razorpay_payment_id,

@@ -49,6 +49,12 @@ def create_razorpay_order(amount: int, currency: str = "INR") -> Dict[str, Any]:
         "payment_capture": 1,
     }
 
+    logger.info(
+        "Razorpay order creation request started for amount=%d %s",
+        amount,
+        currency,
+    )
+
     try:
         order = client.order.create(data=order_payload)
     except razorpay.errors.BadRequestError as exc:
@@ -86,6 +92,13 @@ def create_razorpay_order(amount: int, currency: str = "INR") -> Dict[str, Any]:
             detail="Payment gateway returned invalid response",
         )
 
+    logger.info(
+        "Razorpay order successfully created: order_id=%s, amount=%s, currency=%s",
+        order_id,
+        order.get("amount", amount),
+        order.get("currency", currency),
+    )
+
     return {
         "order_id": order_id,
         "amount": int(order.get("amount", amount)),
@@ -111,15 +124,36 @@ def verify_razorpay_payment(
         "razorpay_signature": signature,
     }
 
+    logger.info(
+        "Razorpay payment signature verification started for order_id=%s, payment_id=%s",
+        order_id,
+        payment_id,
+    )
+
     try:
         result = client.utility.verify_payment_signature(params)
         if result is False:
+            logger.warning(
+                "Razorpay signature verification rejected: invalid signature for order_id=%s, payment_id=%s",
+                order_id,
+                payment_id,
+            )
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Payment verification failed: Invalid signature",
             )
+        logger.info(
+            "Razorpay payment signature verified successfully for order_id=%s, payment_id=%s",
+            order_id,
+            payment_id,
+        )
         return True
     except razorpay.errors.SignatureVerificationError:
+        logger.warning(
+            "Razorpay SignatureVerificationError for order_id=%s, payment_id=%s",
+            order_id,
+            payment_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Payment verification failed: Invalid signature",

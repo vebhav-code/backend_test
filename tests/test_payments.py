@@ -102,6 +102,38 @@ class TestRazorpayPayments(unittest.TestCase):
             )
 
     @patch("razorpay.Client")
+    def test_create_order_logging(self, mock_razorpay_client_cls):
+        """Verify safe debugging logs are emitted without leaking credentials."""
+        mock_client = MagicMock()
+        mock_razorpay_client_cls.return_value = mock_client
+        mock_client.order.create.return_value = {
+            "id": "order_log_test_789",
+            "entity": "order",
+            "amount": 9900,
+            "currency": "INR",
+            "status": "created",
+        }
+
+        with self.assertLogs("calling.payments", level="INFO") as cm:
+            with patch.dict(os.environ, {"RAZORPAY_KEY_ID": self.test_key_id, "RAZORPAY_KEY_SECRET": self.test_key_secret}):
+                response = self.client.post(
+                    "/payments/razorpay/create-order",
+                    json={"amount": 9900, "currency": "INR"},
+                )
+                self.assertEqual(response.status_code, 200)
+
+            log_output = "\n".join(cm.output)
+            # Check required logging elements
+            self.assertIn("Incoming Razorpay create-order endpoint reached", log_output)
+            self.assertIn("9900", log_output)
+            self.assertIn("INR", log_output)
+            self.assertIn("Razorpay order creation request started", log_output)
+            self.assertIn("order_log_test_789", log_output)
+
+            # Ensure secret is NOT logged
+            self.assertNotIn(self.test_key_secret, log_output)
+
+    @patch("razorpay.Client")
     def test_create_order_gateway_error(self, mock_razorpay_client_cls):
         """Handle Razorpay SDK gateway or connection error gracefully."""
         mock_client = MagicMock()
