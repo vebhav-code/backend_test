@@ -65,6 +65,18 @@ class FlaggedNumberResponse(BaseModel):
     verdict: str
     fake_probability: float
     bonafide_score: float
-    flagged_at: datetime
+    fake_detection_count: int = 1
+    last_flagged_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ScamNumberUpdatedEvent(BaseModel):
+    type: str = "scam_number_updated"
+    phone_number: str
+    verdict: str
+    fake_probability: float
+    bonafide_score: float
+    fake_detection_count: int
+    last_flagged_at: str
+

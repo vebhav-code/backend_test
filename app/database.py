@@ -45,11 +45,78 @@ def get_db():
         db.close()
 
 
+def _consolidate_and_migrate_flagged_numbers(eng):
+    """Consolidate duplicate scam numbers and ensure required columns/indices exist."""
+    from sqlalchemy import inspect, text
+
+    try:
+        inspector = inspect(eng)
+        if not inspector.has_table("flagged_numbers"):
+            return
+
+        columns = {col["name"]: col for col in inspector.get_columns("flagged_numbers")}
+        with eng.begin() as conn:
+            # 1. Add fake_detection_count if missing
+            if "fake_detection_count" not in columns:
+                conn.execute(
+                    text("ALTER TABLE flagged_numbers ADD COLUMN fake_detection_count INTEGER NOT NULL DEFAULT 1")
+                )
+
+            # 2. Add or migrate last_flagged_at if missing
+            if "last_flagged_at" not in columns:
+                if "flagged_at" in columns:
+                    try:
+                        conn.execute(
+                            text("ALTER TABLE flagged_numbers RENAME COLUMN flagged_at TO last_flagged_at")
+                        )
+                    except Exception:
+                        conn.execute(text("ALTER TABLE flagged_numbers ADD COLUMN last_flagged_at TIMESTAMP"))
+                        conn.execute(
+                            text("UPDATE flagged_numbers SET last_flagged_at = flagged_at WHERE last_flagged_at IS NULL")
+                        )
+                else:
+                    conn.execute(text("ALTER TABLE flagged_numbers ADD COLUMN last_flagged_at TIMESTAMP"))
+
+            # 3. Consolidate duplicate phone numbers before enforcing uniqueness
+            duplicates = conn.execute(
+                text("SELECT phone_number FROM flagged_numbers GROUP BY phone_number HAVING COUNT(*) > 1")
+            ).fetchall()
+            for row in duplicates:
+                phone = row[0]
+                records = conn.execute(
+                    text(
+                        "SELECT id, fake_detection_count FROM flagged_numbers WHERE phone_number = :phone ORDER BY id DESC"
+                    ),
+                    {"phone": phone},
+                ).fetchall()
+                if len(records) > 1:
+                    latest_id = records[0][0]
+                    total_count = sum(r[1] or 1 for r in records)
+                    conn.execute(
+                        text("UPDATE flagged_numbers SET fake_detection_count = :count WHERE id = :id"),
+                        {"count": total_count, "id": latest_id},
+                    )
+                    other_ids = [r[0] for r in records[1:]]
+                    for oid in other_ids:
+                        conn.execute(text("DELETE FROM flagged_numbers WHERE id = :id"), {"id": oid})
+
+            # 4. Ensure unique index on phone_number
+            try:
+                conn.execute(
+                    text("CREATE UNIQUE INDEX IF NOT EXISTS uq_flagged_numbers_phone_number ON flagged_numbers (phone_number)")
+                )
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning("[Database] Scam number migration/consolidation check: %s", exc)
+
+
 def init_db():
-    """Create all tables in the database if they do not exist."""
+    """Create all tables in the database if they do not exist and ensure migrations are applied."""
     global engine, SessionLocal
     try:
         Base.metadata.create_all(bind=engine)
+        _consolidate_and_migrate_flagged_numbers(engine)
     except Exception as e:
         # If running locally with a Render Internal Database URL (dpg-...), the host
         # only resolves inside Render's private network. Fall back to local SQLite.
@@ -64,5 +131,7 @@ def init_db():
             engine = create_engine(fallback_url, connect_args={"check_same_thread": False})
             SessionLocal.configure(bind=engine)
             Base.metadata.create_all(bind=engine)
+            _consolidate_and_migrate_flagged_numbers(engine)
         else:
             raise e
+

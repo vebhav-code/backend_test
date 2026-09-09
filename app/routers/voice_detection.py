@@ -4,16 +4,18 @@ import logging
 import os
 import re
 import tempfile
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from gradio_client import Client, handle_file
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.connection_manager import manager
-from app.models import FlaggedNumber
+from app.models import FlaggedNumber, get_utc_now
 from app.schemas import FlaggedNumberResponse
+from app.utils import normalize_phone_number
 
 router = APIRouter(tags=["Voice Detection"])
 logger = logging.getLogger(__name__)
@@ -84,6 +86,108 @@ def _parse_result(value: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
             if parsed is not None:
                 return parsed
     return None
+
+
+def record_or_update_scam_number(
+    db: Session,
+    phone_number: str,
+    verdict: str,
+    fake_probability: float,
+    bonafide_score: float,
+) -> Optional[FlaggedNumber]:
+    """
+    Finds or creates a unique scam record for the normalized phone number.
+    - If new: creates a record with fake_detection_count=1.
+    - If existing: increments fake_detection_count by 1, updates scores and last_flagged_at.
+    - Concurrency-safe: handles IntegrityError by rolling back and retrying as update.
+    - Fault-tolerant: rolls back on error and returns None without crashing the caller.
+    """
+    normalized_phone = normalize_phone_number(phone_number)
+    if not normalized_phone:
+        logger.warning("Ignoring invalid scam phone number: %r", phone_number)
+        return None
+
+    now = get_utc_now()
+    try:
+        candidates = [normalized_phone]
+        if normalized_phone.startswith("+"):
+            candidates.append(normalized_phone[1:])
+        else:
+            candidates.append(f"+{normalized_phone}")
+
+        existing = (
+            db.query(FlaggedNumber)
+            .filter(FlaggedNumber.phone_number.in_(candidates))
+            .first()
+        )
+        if existing:
+            existing.fake_detection_count = FlaggedNumber.fake_detection_count + 1
+            existing.verdict = verdict
+            existing.fake_probability = fake_probability
+            existing.bonafide_score = bonafide_score
+            existing.last_flagged_at = now
+            db.commit()
+            db.refresh(existing)
+            logger.info(
+                "Updated existing scam number: phone_number=%r count=%d fake_prob=%.4f",
+                existing.phone_number,
+                existing.fake_detection_count,
+                fake_probability,
+            )
+            return existing
+
+        new_record = FlaggedNumber(
+            phone_number=normalized_phone,
+            verdict=verdict,
+            fake_probability=fake_probability,
+            bonafide_score=bonafide_score,
+            fake_detection_count=1,
+            source="voice_detection",
+            last_flagged_at=now,
+        )
+        try:
+            db.add(new_record)
+            db.commit()
+            db.refresh(new_record)
+            logger.info(
+                "Created new scam number: phone_number=%r count=1 fake_prob=%.4f",
+                normalized_phone,
+                fake_probability,
+            )
+            return new_record
+        except IntegrityError:
+            # Race condition: concurrent insert for the same phone number
+            db.rollback()
+            logger.info(
+                "Concurrent insert conflict for phone_number=%r, retrying update",
+                normalized_phone,
+            )
+            existing = (
+                db.query(FlaggedNumber)
+                .filter(FlaggedNumber.phone_number.in_(candidates))
+                .first()
+            )
+            if existing:
+                existing.fake_detection_count = FlaggedNumber.fake_detection_count + 1
+                existing.verdict = verdict
+                existing.fake_probability = fake_probability
+                existing.bonafide_score = bonafide_score
+                existing.last_flagged_at = now
+                db.commit()
+                db.refresh(existing)
+                logger.info(
+                    "Updated scam number after concurrent insert: phone_number=%r count=%d",
+                    existing.phone_number,
+                    existing.fake_detection_count,
+                )
+                return existing
+            logger.error("Failed to recover from concurrent insert for %r", normalized_phone)
+            return None
+
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to persist/update scam number: %r", normalized_phone)
+        return None
 
 
 @router.post("/voice-detection")
@@ -168,48 +272,55 @@ async def detect_voice(
             result,
         )
         parsed_result = _parse_result(result)
-        if parsed_result is not None and parsed_result["verdict"] == "FAKE" and phone_number:
-            clean_phone_number = phone_number.strip()
-            if re.fullmatch(r"\+?[0-9]{7,15}", clean_phone_number):
-                try:
-                    flagged_number = FlaggedNumber(
-                        phone_number=clean_phone_number,
-                        verdict=parsed_result["verdict"],
+        if parsed_result is not None:
+            verdict = parsed_result.get("verdict")
+            if verdict == "FAKE":
+                logger.info(
+                    "Fake voice detected: fake_probability=%.4f bonafide_score=%.4f phone_number=%r",
+                    parsed_result["fake_probability"],
+                    parsed_result["bonafide_score"],
+                    phone_number,
+                )
+                if phone_number:
+                    scam_record = record_or_update_scam_number(
+                        db=db,
+                        phone_number=phone_number,
+                        verdict=verdict,
                         fake_probability=parsed_result["fake_probability"],
                         bonafide_score=parsed_result["bonafide_score"],
-                        source="voice_detection",
                     )
-                    db.add(flagged_number)
-                    db.commit()
-                    logger.info(
-                        "Persisted flagged number: phone_number=%r verdict=%s",
-                        clean_phone_number,
-                        parsed_result["verdict"],
-                    )
-                    try:
-                        await manager.broadcast(
-                            {
-                                "type": "scam_number_flagged",
-                                "phone_number": clean_phone_number,
-                                "verdict": parsed_result["verdict"],
-                                "fake_probability": parsed_result["fake_probability"],
-                                "bonafide_score": parsed_result["bonafide_score"],
-                                "flagged_at": flagged_number.flagged_at.isoformat(),
-                            }
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to broadcast flagged number: phone_number=%r",
-                            clean_phone_number,
-                        )
-                except Exception:
-                    db.rollback()
-                    logger.exception(
-                        "Failed to persist flagged number: phone_number=%r",
-                        clean_phone_number,
-                    )
-            else:
-                logger.warning("Ignoring invalid flagged phone number: %r", phone_number)
+                    if scam_record is not None:
+                        try:
+                            await manager.broadcast(
+                                {
+                                    "type": "scam_number_updated",
+                                    "phone_number": scam_record.phone_number,
+                                    "verdict": scam_record.verdict,
+                                    "fake_probability": scam_record.fake_probability,
+                                    "bonafide_score": scam_record.bonafide_score,
+                                    "fake_detection_count": scam_record.fake_detection_count,
+                                    "last_flagged_at": scam_record.last_flagged_at.isoformat(),
+                                }
+                            )
+                            logger.info(
+                                "Broadcast scam_number_updated: phone_number=%r count=%d",
+                                scam_record.phone_number,
+                                scam_record.fake_detection_count,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "WebSocket broadcast failure for scam number: phone_number=%r",
+                                scam_record.phone_number,
+                            )
+            elif verdict == "REAL":
+                logger.info(
+                    "Bonafide (REAL) voice detected: fake_probability=%.4f bonafide_score=%.4f phone_number=%r",
+                    parsed_result["fake_probability"],
+                    parsed_result["bonafide_score"],
+                    phone_number,
+                )
+                # REAL voice: Do not add number to scam list
+
         return parsed_result or _unexpected_response(result)
     except Exception:
         logger.exception("Voice detection failed while calling Gradio")
@@ -223,7 +334,7 @@ async def detect_voice(
                 pass
 
 
-@router.get("/scam-numbers", response_model=list[FlaggedNumberResponse])
+@router.get("/scam-numbers", response_model=List[FlaggedNumberResponse])
 def get_scam_numbers(
     limit: int = Query(50, ge=1, le=200),
     phone_number: Optional[str] = Query(None),
@@ -231,5 +342,8 @@ def get_scam_numbers(
 ):
     query = db.query(FlaggedNumber)
     if phone_number:
-        query = query.filter(FlaggedNumber.phone_number == phone_number.strip())
-    return query.order_by(FlaggedNumber.flagged_at.desc()).limit(limit).all()
+        clean = phone_number.strip()
+        normalized = normalize_phone_number(clean) or clean
+        candidates = {normalized, f"+{normalized.lstrip('+')}", normalized.lstrip("+")}
+        query = query.filter(FlaggedNumber.phone_number.in_(candidates))
+    return query.order_by(FlaggedNumber.last_flagged_at.desc()).limit(limit).all()

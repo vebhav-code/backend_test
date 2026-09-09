@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import app.models
-from app.database import Base, engine
+from app.database import Base, engine, init_db
 from app.routers import contacts, noise_removal, users, voice_detection
 from app.ws import router as ws_router
 
@@ -20,8 +20,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup():
-    """Create the existing user/contact tables on startup."""
-    Base.metadata.create_all(bind=engine)
+    """Create tables and ensure scam number schema/migration on startup."""
+    init_db()
+
 
 
 app.include_router(users.router)

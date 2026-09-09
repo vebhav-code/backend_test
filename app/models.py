@@ -47,9 +47,23 @@ class FlaggedNumber(Base):
     __tablename__ = "flagged_numbers"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    phone_number = Column(String, index=True, nullable=False)
+    phone_number = Column(String, unique=True, index=True, nullable=False)
     verdict = Column(String, nullable=False)
     fake_probability = Column(Float, nullable=False)
     bonafide_score = Column(Float, nullable=False)
+    fake_detection_count = Column(Integer, nullable=False, default=1)
     source = Column(String, nullable=False, default="voice_detection")
-    flagged_at = Column(DateTime(timezone=True), default=get_utc_now, nullable=False)
+    last_flagged_at = Column(DateTime(timezone=True), default=get_utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("phone_number", name="uq_flagged_numbers_phone_number"),
+    )
+
+    @property
+    def flagged_at(self):
+        return self.last_flagged_at
+
+    @flagged_at.setter
+    def flagged_at(self, value):
+        self.last_flagged_at = value
+
