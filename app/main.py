@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import app.models
 from app.database import Base, engine, init_db
-from app.routers import contacts, noise_removal, users, voice_detection
+from app.routers import contacts, noise_removal, payments, users, voice_detection
 from app.ws import router as ws_router
 
 
@@ -30,6 +30,7 @@ app.include_router(users.login_router)
 app.include_router(contacts.router)
 app.include_router(voice_detection.router)
 app.include_router(noise_removal.router)
+app.include_router(payments.router)
 app.include_router(ws_router)
 
 
